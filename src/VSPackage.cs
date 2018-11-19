@@ -1,12 +1,17 @@
 ﻿using System;
+using System.IO;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Media;
 using EnvDTE;
+using Microsoft;
 using Microsoft.VisualStudio;
+using Microsoft.VisualStudio.ComponentModelHost;
+using Microsoft.VisualStudio.LanguageServices;
 using Microsoft.VisualStudio.Shell;
 using Microsoft.VisualStudio.Shell.Interop;
 using Microsoft.VisualStudio.Threading;
@@ -100,110 +105,104 @@ namespace StringResourceVisualizer
 
         private async Task HandleOpenSolutionAsync(CancellationToken cancellationToken)
         {
-            await JoinableTaskFactory.SwitchToMainThreadAsync(cancellationToken);
-
-            //Use nested methods to avoid prompt (and need) for multiple MainThead checks/switches
-            IEnumerable<ProjectItem> RecurseProjectItems(ProjectItems projItems)
-            {
-                if (projItems != null)
-                {
-                    foreach (ProjectItem item in projItems)
-                    {
-                        foreach (var subItem in RecurseProjectItem(item))
-                        {
-                            yield return subItem;
-                        }
-                    }
-                }
-            }
-
-            IEnumerable<ProjectItem> RecurseProjectItem(ProjectItem item)
-            {
-                yield return item;
-                foreach (var subItem in RecurseProjectItems(item.ProjectItems))
-                {
-                    yield return subItem;
-                }
-            }
-
-            IEnumerable<ProjectItem> GetProjectFiles(Project proj)
-            {
-                foreach (ProjectItem item in RecurseProjectItems(proj.ProjectItems))
-                {
-                    yield return item;
-                }
-            }
-
             // TODO: handle res files being removed or added to a project - currently will be ignored. Issue #2
             // Get all resource files from the solution
             // Do this now, rather than in adornment manager for performance and to avoid thread issues
+            ResourceAdornmentManager.ResourceFiles = await FindResourceFilesAsync(this);
+
+            await JoinableTaskFactory.SwitchToMainThreadAsync(cancellationToken);
+
+            var startTime2 = DateTime.Now;
+            IVsFontAndColorStorage storage = (IVsFontAndColorStorage)VSPackage.GetGlobalService(typeof(IVsFontAndColorStorage));
+
+            var guid = new Guid("A27B4E24-A735-4d1d-B8E7-9716E1E3D8E0");
+
+            // Seem like reasonabel defaults as should be visible on light & dark theme
+            int _fontSize = 10;
+            Color _textColor = Colors.Gray;
+
+            if (storage != null && storage.OpenCategory(ref guid, (uint)(__FCSTORAGEFLAGS.FCSF_READONLY | __FCSTORAGEFLAGS.FCSF_LOADDEFAULTS)) == Microsoft.VisualStudio.VSConstants.S_OK)
+            {
+                LOGFONTW[] Fnt = new LOGFONTW[] { new LOGFONTW() };
+                FontInfo[] Info = new FontInfo[] { new FontInfo() };
+                storage.GetFont(Fnt, Info);
+
+                _fontSize = Info[0].wPointSize;
+            }
+
+            if (storage != null && storage.OpenCategory(ref guid, (uint)(__FCSTORAGEFLAGS.FCSF_NOAUTOCOLORS | __FCSTORAGEFLAGS.FCSF_LOADDEFAULTS)) == Microsoft.VisualStudio.VSConstants.S_OK)
+            {
+                var info = new ColorableItemInfo[1];
+
+                // Get the color value configured for regular string display
+                storage.GetItem("String", info);
+
+                var win32Color = (int)info[0].crForeground;
+
+                int r = win32Color & 0x000000FF;
+                int g = (win32Color & 0x0000FF00) >> 8;
+                int b = (win32Color & 0x00FF0000) >> 16;
+
+                _textColor = Color.FromRgb((byte)r, (byte)g, (byte)b);
+            }
+
+            ResourceAdornmentManager.TextSize = _fontSize;
+            ResourceAdornmentManager.TextForegroundColor = _textColor;
+
             if (await this.GetServiceAsync(typeof(DTE)) is DTE dte)
             {
-                foreach (var project in dte.Solution.Projects)
-                {
-                    foreach (var solFile in GetProjectFiles((Project)project))
-                    {
-                        if (solFile.Kind != EnvDTE.Constants.vsProjectItemKindPhysicalFile)
-                        {
-                            // We're only interested in files
-                            continue;
-                        }
-
-                        // The index of file names from 1 to FileCount for the project item.
-                        var filePath = solFile.FileNames[1];
-                        var fileExt = System.IO.Path.GetExtension(filePath);
-
-                        // Only interested in resx files
-                        if (fileExt.Equals(".resx"))
-                        {
-                            // Only want neutral language ones, not locale specific versions
-                            if (!System.IO.Path.GetFileNameWithoutExtension(filePath).Contains("."))
-                            {
-                                ResourceAdornmentManager.ResourceFiles.Add(filePath);
-                            }
-                        }
-                    }
-                }
-
-                IVsFontAndColorStorage storage = (IVsFontAndColorStorage)VSPackage.GetGlobalService(typeof(IVsFontAndColorStorage));
-
-                var guid = new Guid("A27B4E24-A735-4d1d-B8E7-9716E1E3D8E0");
-
-                // Seem like reasonabel defaults as should be visible on light & dark theme
-                int _fontSize = 10;
-                Color _textColor = Colors.Gray;
-
-                if (storage != null && storage.OpenCategory(ref guid, (uint)(__FCSTORAGEFLAGS.FCSF_READONLY | __FCSTORAGEFLAGS.FCSF_LOADDEFAULTS)) == Microsoft.VisualStudio.VSConstants.S_OK)
-                {
-                    LOGFONTW[] Fnt = new LOGFONTW[] { new LOGFONTW() };
-                    FontInfo[] Info = new FontInfo[] { new FontInfo() };
-                    storage.GetFont(Fnt, Info);
-
-                    _fontSize = Info[0].wPointSize;
-                }
-
-                if (storage != null && storage.OpenCategory(ref guid, (uint)(__FCSTORAGEFLAGS.FCSF_NOAUTOCOLORS | __FCSTORAGEFLAGS.FCSF_LOADDEFAULTS)) == Microsoft.VisualStudio.VSConstants.S_OK)
-                {
-                    var info = new ColorableItemInfo[1];
-
-                    // Get the color value configured for regular string display
-                    storage.GetItem("String", info);
-
-                    var win32Color = (int)info[0].crForeground;
-
-                    int r = win32Color & 0x000000FF;
-                    int g = (win32Color & 0x0000FF00) >> 8;
-                    int b = (win32Color & 0x00FF0000) >> 16;
-
-                    _textColor = Color.FromRgb((byte)r, (byte)g, (byte)b);
-                }
-
-                ResourceAdornmentManager.TextSize = _fontSize;
-                ResourceAdornmentManager.TextForegroundColor = _textColor;
-
                 var plural = ResourceAdornmentManager.ResourceFiles.Count > 1 ? "s" : string.Empty;
                 dte.StatusBar.Text = $"String Resource Visualizer initialized with {ResourceAdornmentManager.ResourceFiles.Count} resource file{plural}.";
             }
+
+            var took2 = DateTime.Now - startTime2;
+            System.Diagnostics.Trace.WriteLine($"HandleOpenSolutionAsync took {took2.TotalSeconds} seconds");
+        }
+
+        private static async Task<List<string>> FindResourceFilesAsync(
+            Microsoft.VisualStudio.Shell.IAsyncServiceProvider asyncServiceProvider)
+        {
+            // Run using the thread pool
+            await TaskScheduler.Default;
+
+            // Get the VisualStudioWorkspace from MEF
+            var componentModel = await asyncServiceProvider.GetServiceAsync(typeof(SComponentModel)) as IComponentModel;
+            Assumes.NotNull(componentModel);
+            var visualStudioWorkspace = componentModel.GetService<VisualStudioWorkspace>();
+            Assumes.NotNull(visualStudioWorkspace);
+
+            var resourceFiles = new List<string>();
+            foreach (var project in visualStudioWorkspace.CurrentSolution.Projects)
+            {
+                foreach (var document in project.Documents)
+                {
+
+                    var postfix = ".Designer.cs";
+                    var filePath = document.FilePath;
+
+                    if (!filePath.EndsWith(postfix))
+                    {
+                        continue;
+                    }
+
+                    var resxFile = filePath.Substring(0, filePath.Length - postfix.Length) + ".resx";
+                    if (!File.Exists(resxFile))
+                    {
+                        continue;
+                    }
+
+                    if (Path.GetFileNameWithoutExtension(resxFile).Contains("."))
+                    {
+                        // Only want neutral language ones, not locale specific versions
+                        continue;
+                    }
+
+                    Trace.WriteLine($"Found resource file at {resxFile}");
+                    resourceFiles.Add(resxFile);
+                }
+            }
+
+            return resourceFiles;
         }
     }
 
